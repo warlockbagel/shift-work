@@ -430,7 +430,7 @@ AWS Config Rules
 
 ---
 
-## �📖 Related Documentation
+## 📖 Related Documentation
 
 - [AWS CloudTrail Documentation](https://docs.aws.amazon.com/cloudtrail/)
 - [Amazon EventBridge Documentation](https://docs.aws.amazon.com/eventbridge/)
