@@ -246,7 +246,7 @@ Extend SSM automation to:
 1. **CloudTrail Dependency**: Requires CloudTrail to be properly configured
 2. **Event Delay**: ~5 minute average delay (1-15 minute range) due to CloudTrail processing
 3. **API Calls Only**: Only detects actual `EnableSerialConsoleAccess` calls
-. **No Policy Prevention**: Doesn't prevent IAM policy changes that grant permissions
+4. **No Policy Prevention**: Doesn't prevent IAM policy changes that grant permissions
 
 ## 🧹 Cleanup
 
