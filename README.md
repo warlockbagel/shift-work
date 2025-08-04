@@ -289,7 +289,7 @@ aws cloudformation describe-stacks --stack-name ec2-serial-console-event-monitor
 
 ---
 
-## �️ Alternative Security Approaches
+## 🛡️ Alternative Security Approaches
 
 While this event-driven solution provides excellent **reactive security** (detecting and responding to events), organizations should consider a **defense-in-depth approach** combining multiple strategies:
 
