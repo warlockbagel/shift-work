@@ -1,0 +1,381 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Event-driven CloudFormation template to immediately respond to EC2 Serial Console enable events'
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive notifications when EC2 Serial Console is enabled
+    Default: admin@example.com
+    ConstraintDescription: Must be a valid email address
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    
+  AutoRemediation:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to automatically disable serial console access when detected
+
+Resources:
+  # SNS Topic for notifications
+  EC2SerialConsoleNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: EC2SerialConsoleSecurityAlerts
+      DisplayName: EC2 Serial Console Security Monitoring
+      KmsMasterKeyId: alias/aws/sns
+
+  # SNS Topic Policy
+  EC2SerialConsoleNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref EC2SerialConsoleNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSSMAutomationPublish
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt SSMAutomationRole.Arn
+            Action: sns:Publish
+            Resource: !Ref EC2SerialConsoleNotificationTopic
+          - Sid: AllowAccountRootSubscribe
+            Effect: Allow
+            Principal:
+              AWS: !Ref 'AWS::AccountId'
+            Action: sns:Subscribe
+            Resource: !Ref EC2SerialConsoleNotificationTopic
+            Condition:
+              StringEquals:
+                sns:Endpoint: !Ref NotificationEmail
+
+  # IAM Role for SSM Automation
+  SSMAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EC2SerialConsoleSSMAutomationRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EC2SerialConsoleRemediationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DisableSerialConsoleAccess
+                  - ec2:GetSerialConsoleAccessStatus
+                Resource: '*'
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref EC2SerialConsoleNotificationTopic
+
+  # SSM Automation Document for immediate response
+  SSMRemediationDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Name: EC2SerialConsoleImmediateRemediation
+      Content:
+        schemaVersion: '0.3'
+        description: 'Immediately disable EC2 Serial Console access when enabled and send notification'
+        assumeRole: !GetAtt SSMAutomationRole.Arn
+        parameters:
+          SNSTopicArn:
+            type: String
+            description: 'SNS Topic ARN for notifications'
+            default: !Ref EC2SerialConsoleNotificationTopic
+          AutoRemediation:
+            type: String
+            description: 'Whether to automatically disable serial console access'
+            default: !Ref AutoRemediation
+          EventDetails:
+            type: String
+            description: 'Event details from EventBridge'
+            default: 'Manual execution'
+        mainSteps:
+          - name: CheckCurrentStatus
+            action: 'aws:executeAwsApi'
+            inputs:
+              Service: ec2
+              Api: GetSerialConsoleAccessStatus
+            outputs:
+              - Name: CurrentStatus
+                Selector: $.SerialConsoleAccessEnabled
+                Type: Boolean
+
+          - name: EvaluateResponse
+            action: 'aws:branch'
+            inputs:
+              Choices:
+                - NextStep: DisableSerialConsole
+                  Variable: '{{ CheckCurrentStatus.CurrentStatus }}'
+                  BooleanEquals: true
+                - NextStep: NotifyAlreadyDisabled
+                  Variable: '{{ CheckCurrentStatus.CurrentStatus }}'
+                  BooleanEquals: false
+
+          - name: DisableSerialConsole
+            action: 'aws:branch'
+            inputs:
+              Choices:
+                - NextStep: ExecuteDisable
+                  Variable: '{{ AutoRemediation }}'
+                  StringEquals: 'true'
+                - NextStep: NotifyNoAction
+                  Variable: '{{ AutoRemediation }}'
+                  StringEquals: 'false'
+
+          - name: ExecuteDisable
+            action: 'aws:executeAwsApi'
+            inputs:
+              Service: ec2
+              Api: DisableSerialConsoleAccess
+            nextStep: NotifyDisabled
+
+          - name: NotifyDisabled
+            action: 'aws:executeAwsApi'
+            inputs:
+              Service: sns
+              Api: Publish
+              TopicArn: '{{ SNSTopicArn }}'
+              Subject: '🚨 SECURITY ACTION: EC2 Serial Console Access DISABLED'
+              Message: !Sub |
+                🔒 IMMEDIATE SECURITY RESPONSE EXECUTED
+                
+                ALERT: Someone attempted to enable EC2 Serial Console Access
+                ACTION: Serial Console Access has been AUTOMATICALLY DISABLED
+                
+                Event Details: {{ EventDetails }}
+                
+                Timestamp: {{ global:DATE_TIME }}
+                Account: ${AWS::AccountId}
+                Region: ${AWS::Region}
+                
+                ✅ SECURITY STATUS: EC2 Serial Console Access is now DISABLED
+                
+                NEXT STEPS:
+                1. Review CloudTrail logs for the EnableSerialConsoleAccess event
+                2. Identify who attempted to enable serial console access
+                3. Verify this was authorized activity
+                4. Consider additional security measures if unauthorized
+                
+                This automated response helps maintain security posture by preventing
+                unauthorized access to EC2 instances via serial console.
+            isEnd: true
+
+          - name: NotifyNoAction
+            action: 'aws:executeAwsApi'
+            inputs:
+              Service: sns
+              Api: Publish
+              TopicArn: '{{ SNSTopicArn }}'
+              Subject: '⚠️ SECURITY ALERT: EC2 Serial Console Access ENABLED (No Auto-Remediation)'
+              Message: !Sub |
+                🔍 SECURITY MONITORING ALERT
+                
+                DETECTED: Someone enabled EC2 Serial Console Access
+                ACTION: No automatic remediation (AutoRemediation=false)
+                
+                Event Details: {{ EventDetails }}
+                
+                Timestamp: {{ global:DATE_TIME }}
+                Account: ${AWS::AccountId}
+                Region: ${AWS::Region}
+                
+                ⚠️ SECURITY STATUS: EC2 Serial Console Access is ENABLED
+                
+                IMMEDIATE ACTION REQUIRED:
+                1. Review if this enablement was authorized
+                2. If unauthorized, manually disable: aws ec2 disable-serial-console-access
+                3. Review CloudTrail logs for the EnableSerialConsoleAccess event
+                4. Implement additional security controls if needed
+                
+                Consider enabling AutoRemediation for immediate response to future events.
+            isEnd: true
+
+          - name: NotifyAlreadyDisabled
+            action: 'aws:executeAwsApi'
+            inputs:
+              Service: sns
+              Api: Publish
+              TopicArn: '{{ SNSTopicArn }}'
+              Subject: '✅ EC2 Serial Console Already Disabled'
+              Message: !Sub |
+                📋 STATUS CHECK COMPLETED
+                
+                TRIGGERED: EC2 Serial Console monitoring detected an event
+                STATUS: EC2 Serial Console Access is already DISABLED
+                
+                Event Details: {{ EventDetails }}
+                
+                Timestamp: {{ global:DATE_TIME }}
+                Account: ${AWS::AccountId}
+                Region: ${AWS::Region}
+                
+                ✅ SECURITY STATUS: No action needed - Serial Console Access remains DISABLED
+                
+                This may have been a duplicate event or the console was already disabled
+                by another process. Monitoring continues as normal.
+            isEnd: true
+
+  # EventBridge Rule to detect serial console enable events
+  SerialConsoleEnableEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: EC2SerialConsoleEnableDetection
+      Description: Detects when EC2 Serial Console Access is enabled via API or Console
+      EventPattern:
+        source:
+          - aws.ec2
+        detail-type:
+          - AWS API Call via CloudTrail
+          - AWS Console Action via CloudTrail
+        detail:
+          eventSource:
+            - ec2.amazonaws.com
+          eventName:
+            - EnableSerialConsoleAccess
+      State: ENABLED
+      Targets:
+        - Arn: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${SSMRemediationDocument}'
+          Id: SSMRemediationTarget
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              account: $.detail.userIdentity.accountId
+              region: $.detail.awsRegion
+              eventTime: $.detail.eventTime
+              sourceIPAddress: $.detail.sourceIPAddress
+              userAgent: $.detail.userAgent
+            InputTemplate: !Sub |
+              {
+                "SNSTopicArn": ["${EC2SerialConsoleNotificationTopic}"],
+                "AutoRemediation": ["${AutoRemediation}"],
+                "EventDetails": ["🚨 EC2 Serial Console Access ENABLED detected!\n\nAccount: <account>\nRegion: <region>\nTime: <eventTime>\nSource IP: <sourceIPAddress>\nUser Agent: <userAgent>\n\nImmediate security response initiated..."]
+              }
+
+  # IAM Role for EventBridge to execute SSM
+  EventBridgeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EventBridgeSSMExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SSMAutomationExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ssm:StartAutomationExecution
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${SSMRemediationDocument}:*'
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !GetAtt SSMAutomationRole.Arn
+
+  # CloudWatch Alarm for monitoring automation execution failures
+  SSMAutomationFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: EC2SerialConsole-SSMAutomationFailures
+      AlarmDescription: Monitors for failures in EC2 Serial Console SSM automation executions
+      MetricName: ExecutionsFailed
+      Namespace: AWS/SSM-RunCommand
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: DocumentName
+          Value: !Ref SSMRemediationDocument
+      AlarmActions:
+        - !Ref EC2SerialConsoleNotificationTopic
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm for monitoring EventBridge invocation failures
+  EventBridgeFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: EC2SerialConsole-EventBridgeFailures
+      AlarmDescription: Monitors for failed EventBridge rule invocations
+      MetricName: FailedInvocations
+      Namespace: AWS/Events
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: RuleName
+          Value: !Ref SerialConsoleEnableEventRule
+      AlarmActions:
+        - !Ref EC2SerialConsoleNotificationTopic
+      TreatMissingData: notBreaching
+
+  # SNS Subscription - Created as last step to ensure stack is fully deployed
+  EmailNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref EC2SerialConsoleNotificationTopic
+      Endpoint: !Ref NotificationEmail
+      Protocol: email
+    DependsOn:
+      - SerialConsoleEnableEventRule
+      - SSMRemediationDocument
+      - EventBridgeFailureAlarm
+      - SSMAutomationFailureAlarm
+
+Outputs:
+  SNSTopicArn:
+    Description: ARN of the SNS topic for EC2 Serial Console notifications
+    Value: !Ref EC2SerialConsoleNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopic'
+
+  EventBridgeRuleArn:
+    Description: ARN of the EventBridge rule monitoring EC2 Serial Console events
+    Value: !GetAtt SerialConsoleEnableEventRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventRule'
+
+  SSMDocumentName:
+    Description: Name of the SSM Automation Document for remediation
+    Value: !Ref SSMRemediationDocument
+    Export:
+      Name: !Sub '${AWS::StackName}-SSMDocument'
+
+  ResponseType:
+    Description: Type of monitoring solution deployed
+    Value: 'Event-Driven Real-Time Response'
+    Export:
+      Name: !Sub '${AWS::StackName}-ResponseType'
+
+  TroubleshootingCommands:
+    Description: Commands to troubleshoot the event-driven solution
+    Value: !Sub |
+      # Check EventBridge metrics:
+      aws cloudwatch get-metric-statistics --namespace AWS/Events --metric-name MatchedEvents --dimensions Name=RuleName,Value=${SerialConsoleEnableEventRule} --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ) --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) --period 3600 --statistics Sum
+      
+      # Check for failed invocations:
+      aws cloudwatch get-metric-statistics --namespace AWS/Events --metric-name FailedInvocations --dimensions Name=RuleName,Value=${SerialConsoleEnableEventRule} --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ) --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) --period 3600 --statistics Sum
+      
+      # Check SSM automation executions:
+      aws ssm describe-automation-executions --filters "Key=DocumentNamePrefix,Values=${SSMRemediationDocument}"
+      
+      # Test manual trigger:
+      aws ssm start-automation-execution --document-name ${SSMRemediationDocument} --parameters "SNSTopicArn=${EC2SerialConsoleNotificationTopic},AutoRemediation=true"
+
+
